@@ -2,7 +2,6 @@ import time
 
 import clip
 import numpy as np
-import PIL
 
 import snntorch as snn
 import snntorch.surrogate
@@ -12,7 +11,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
-from torchvision import transforms
 from torchvision.models.efficientnet import efficientnet_b0
 from torchvision.datasets import CIFAR10
 
@@ -234,7 +232,7 @@ if __name__ == "__main__":
     latent_dim = 16
     num_steps = 20
     batch_size = 128
-    num_epochs = 30
+    num_epochs = 20
     cnn_feature_dim = 1280
     clip_embed_dim = 512
     decoder_beta_lif = 0.9
@@ -280,4 +278,21 @@ if __name__ == "__main__":
     training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
                   clip_model, train_loader, test_loader, optimizer, num_epochs,
                   num_steps, device)
+
+    model = {
+        "spike_encoder": spike_encoder.state_dict(),
+        "spike_decoder": spike_decoder.state_dict(),
+        "recon_head": recon_head.state_dict(),
+        "adapter": adapter.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "hyperparameters": {
+            "n_neurons": num_encoder_neurons,
+            "n_hidden": num_hidden_neurons,
+            "latent_dim": latent_dim,
+            "num_steps": num_steps,
+            "num_epochs": num_epochs,
+        },
+    }
+    torch.save(model, "model.pt")
+
     print("Done")
