@@ -1,9 +1,14 @@
+import time
+
+import clip
 import numpy as np
+import PIL
 
 import snntorch as snn
 import snntorch.surrogate
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -52,23 +57,28 @@ class SpikeDecoder(nn.Module):
         return self.mlp(firing_rates)
 
 
-class NN(nn.Module):
+class Autoencoder(nn.Module):
 
-    def __init__(self, num_hidden_neuron, num_encoder_neuron, latent_dim,
+    def __init__(self, num_hidden_neurons, num_encoder_neurons, latent_dim,
                  num_steps):
         """
+        Parameters
+        ------------
         input_dim: the dimension of the input data
-        num_hidden_neuron: the hidden dimension
+        num_hidden_neuron: number of neurons in the hidden layer within the spike encoder
+        num_encoder_neuron: number of neurons in the output layer of the spike encoder
+        latent_dim: dimension of the output layer of the spike decoder
+        num_steps: number of time steps for the encoding process
         """
         super().__init__()
         self.cnn = efficientnet_b0()
         self.cnn.classifier = nn.Identity()
         # This only works for EfficientNet and MobileNet from TorchVision
         input_dim = 1280
-        self.spike_encoder = SpikeEncoder(input_dim, num_hidden_neuron,
-                                          num_encoder_neuron, beta=0.9,
+        self.spike_encoder = SpikeEncoder(input_dim, num_hidden_neurons,
+                                          num_encoder_neurons, beta=0.9,
                                           num_steps=num_steps)
-        self.spike_output = SpikeDecoder(num_encoder_neuron, latent_dim)
+        self.spike_output = SpikeDecoder(num_encoder_neurons, latent_dim)
         # Adapter to direct output from the spike train output to CLIP
         # self.adapter = ...
         self.composite = nn.Sequential(self.cnn,
@@ -110,67 +120,75 @@ def print_batch_accuracy(net, data, targets, batch_size, train=False):
         print(f"Test set accuracy for a single minibatch: {acc*100:.2f}%")
 
 
-def training_loop(net, train_loader, test_loader, loss,
-                  optimizer, batch_size, num_epochs):
-    dtype = torch.float
-    loss_hist = []
-    test_loss_hist = []
+def compute_losses(batch_images, cnn, clip_model,
+                   spike_encoder, spike_decoder, recon_head, adapter, device):
+    batch_images = batch_images.to(device)
+    with torch.no_grad():
+        cnn_features = cnn(batch_images)                                # [B, 1280]
+        clip_embedding = clip_model.encode_image(batch_images).float()  # [B, 512]
+    spk_rec, _ = spike_encoder(cnn_features)  # [T, B, num_encoder_neurons]
+    decoded = spike_decoder(spk_rec)          # [B, latent_dim]
+    recon = recon_head(decoded)               # [B, 1280]
+    clip_hat = adapter(decoded)               # [B, 512]
+    recon_loss = F.mse_loss(recon, cnn_features)
+    semantic_loss = 1 - F.cosine_similarity(clip_hat, clip_embedding.detach()).mean()
+    sparsity_loss = spk_rec.mean()
+    return recon_loss, semantic_loss, sparsity_loss
+
+
+def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
+                  clip_model, train_loader, test_loader, optimizer, num_epochs,
+                  num_steps, device):
+    start_time = time.time()
+    trainable = [spike_encoder, spike_decoder, recon_head, adapter]
     counter = 0
-    # Outer training loop
     for epoch in range(num_epochs):
-        iter_counter = 0
-        train_batch = iter(train_loader)
+        for batch_images, _ in train_loader:
+            recon_loss, semantic_loss, sparsity_loss = compute_losses(
+                batch_images, cnn, clip_model,
+                spike_encoder, spike_decoder, recon_head, adapter, device)
+            total_loss = recon_loss + 0.5 * semantic_loss + 0.01 * sparsity_loss
 
-        # Minibatch training loop
-        for data, targets in train_batch:
-            data = data.to(device)
-            targets = targets.to(device)
-
-            # forward pass
-            net.train()
-            spk_rec, mem_rec = net(data)
-
-            # initialize the loss & sum over time
-            loss_val = torch.zeros((1), dtype=dtype, device=device)
-            for step in range(num_steps):
-                loss_val += loss(mem_rec[step], targets)
-
-            # Gradient calculation + weight update
             optimizer.zero_grad()
-            loss_val.backward()
+            total_loss.backward()
             optimizer.step()
 
-            # Store loss history for future plotting
-            loss_hist.append(loss_val.item())
+            if counter % 100 == 0:
+                print(f"Iter {counter} | "
+                      f"recon {recon_loss.item():.4f} | "
+                      f"semantic {semantic_loss.item():.4f} | "
+                      f"sparsity {sparsity_loss.item():.4f} | "
+                      f"total {total_loss.item():.4f} | "
+                      f"elapsed {round(time.time() - start_time, 2)}")
+            counter += 1
 
-            # Test set
-            with torch.no_grad():
-                net.eval()
-                test_data, test_targets = next(iter(test_loader))
-                test_data = test_data.to(device)
-                test_targets = test_targets.to(device)
+        for m in trainable:
+            m.eval()
 
-                # Test set forward pass
-                test_spk, test_mem = net(test_data)
+        total_recon = total_semantic = total_sparsity = 0.0
+        n_batches = 0
+        with torch.no_grad():
+            for batch_images, _ in test_loader:
+                rl, sl, spl = compute_losses(
+                    batch_images, cnn, clip_model,
+                    spike_encoder, spike_decoder, recon_head, adapter, device)
+                total_recon += rl.item()
+                total_semantic += sl.item()
+                total_sparsity += spl.item()
+                n_batches += 1
 
-                # Test set loss
-                test_loss = torch.zeros((1), dtype=dtype, device=device)
-                for step in range(num_steps):
-                    test_loss += loss(test_mem[step], test_targets)
-                test_loss_hist.append(test_loss.item())
+        avg_recon = total_recon / n_batches
+        avg_semantic = total_semantic / n_batches
+        avg_sparsity = total_sparsity / n_batches
+        avg_total = avg_recon + 0.5 * avg_semantic + 0.01 * avg_sparsity
+        print(f"Epoch {epoch} evaluation | "
+              f"recon {avg_recon:.4f} | "
+              f"semantic {avg_semantic:.4f} | "
+              f"sparsity {avg_sparsity:.4f} | "
+              f"total {avg_total:.4f}")
 
-                # Print train/test loss/accuracy
-                if counter % 50 == 0:
-                    print(f"Epoch {epoch}, Iteration {iter_counter}")
-                    print(f"Train Set Loss: {loss_hist[counter]:.2f}")
-                    print(f"Test Set Loss: {test_loss_hist[counter]:.2f}")
-                    print_batch_accuracy(net, data, targets, batch_size,
-                                         train=True)
-                    print_batch_accuracy(net, test_data, test_targets,
-                                         batch_size, train=False)
-                    print("\n")
-                counter += 1
-                iter_counter +=1
+        for m in trainable:
+            m.train()
 
 
 if __name__ == "__main__":
@@ -186,34 +204,44 @@ if __name__ == "__main__":
     latent_dim = 16
     num_steps = 20
     batch_size = 128
-    num_epochs = 10
+    num_epochs = 30
+    cnn_feature_dim = 1280
+    clip_embed_dim = 512
 
-    raw_dataset = CIFAR10('cifar10', train=True, download=True,
-                          transform=transforms.ToTensor())
-    net = NN(num_hidden_neurons, num_encoder_neurons, latent_dim,
-             num_steps).to(device)
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    clip_model.requires_grad_(False)
 
-    normalization = compute_normalization(raw_dataset)
-    transform = transforms.Compose([transforms.Resize((224, 224)),
-                                    transforms.ToTensor(),
-                                    transforms.Normalize(*normalization)])
-    # transform = transforms.Compose([transforms.Resize((224, 224)),
-    #                                 transforms.ToTensor(),
-    #                                 transforms.Normalize((0, 0, 0), (1, 1, 1))])
+    cnn = efficientnet_b0().to(device)
+    cnn.classifier = nn.Identity()
+    for p in cnn.parameters():
+        p.requires_grad_(False)
 
+    spike_encoder = SpikeEncoder(cnn_feature_dim, num_hidden_neurons,
+                                 num_encoder_neurons, beta=0.9,
+                                 num_steps=num_steps).to(device)
+    spike_decoder = SpikeDecoder(num_encoder_neurons, latent_dim).to(device)
+    recon_head = nn.Linear(latent_dim, cnn_feature_dim).to(device)
+    adapter = nn.Linear(latent_dim, clip_embed_dim).to(device)
 
-    loss = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=5e-4,
-                                 betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(
+        list(spike_encoder.parameters()) +
+        list(spike_decoder.parameters()) +
+        list(recon_head.parameters()) +
+        list(adapter.parameters()),
+        lr=5e-4, betas=(0.9, 0.999)
+    )
 
-    train_dataset = CIFAR10('cifar10', train=True, transform=transform,
+    train_dataset = CIFAR10('cifar10', train=True, transform=preprocess,
                             download=True)
-    test_dataset = CIFAR10('cifar10', train=False, transform=transform,
-                           download=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                              drop_last=True, num_workers=4, shuffle=True)
 
-    train_dataset_loader = DataLoader(train_dataset, drop_last=True,
-                                      batch_size=batch_size)
-    test_dataset_loader = DataLoader(test_dataset, drop_last=True,
-                                      batch_size=batch_size)
-    training_loop(net, train_dataset_loader, test_dataset_loader, loss,
-                  optimizer, batch_size, num_epochs)
+    test_dataset = CIFAR10('cifar10', train=False, transform=preprocess,
+                           download=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size,
+                             drop_last=True, num_workers=4, shuffle=False)
+
+    training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
+                  clip_model, train_loader, test_loader, optimizer, num_epochs,
+                  num_steps, device)
+    print("Done")
