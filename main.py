@@ -44,17 +44,46 @@ class SpikeEncoder(nn.Module):
         return torch.stack(spk2_rec, dim=0), torch.stack(mem2_rec, dim=0)
 
 
+class LeakyIntegrator(nn.Module):
+
+    def __init__(self, beta=0.95):
+        super().__init__()
+        self.register_buffer("beta", torch.as_tensor(beta, dtype=torch.float))
+
+    def forward(self, inputs):  # inputs: [T, B, N]
+        mem = torch.zeros_like(inputs[0])
+        mem_seq = []
+        for inp in inputs:
+            mem = self.beta.clamp(0, 1) * mem + inp
+            mem_seq.append(mem)
+        return torch.stack(mem_seq, dim=0)  # [T, B, N]
+
+
 class SpikeDecoder(nn.Module):
 
-    def __init__(self, num_neurons, latent_dim):
+    def __init__(self, n1, n2, n4, beta_lif=0.9, beta_li=0.95, n3=64):
         super().__init__()
-        # Project from the hidden space to the latent space linearly
-        self.mlp = nn.Sequential(nn.Linear(num_neurons, latent_dim),
-                                 nn.LayerNorm(latent_dim))
+        self.fc_lif = nn.Linear(n2, n1)
+        self.lif = snn.Leaky(beta=beta_lif)
+        self.fc_li = nn.Linear(n1, n2)
+        self.li = LeakyIntegrator(beta=beta_li)
+        self.mlp = nn.Sequential(nn.Linear(n2, n3),
+                                 nn.ReLU(),
+                                 nn.Linear(n3, n4),
+                                 nn.LayerNorm(n4))
 
-    def forward(self, input):
-        firing_rates = input.mean(dim=0)  # aggregate over time
-        return self.mlp(firing_rates)
+    def forward(self, spk_rec):  # spk_rec: [T, B, N2]
+        num_steps = spk_rec.shape[0]
+        mem = self.lif.init_leaky()
+        lif_spk_seq = []
+        for t in range(num_steps):
+            cur = self.fc_lif(spk_rec[t])  # [B, N2]
+            spk, mem = self.lif(cur, mem)  # [B, N2]
+            lif_spk_seq.append(spk)
+        lif_spk_seq = torch.stack(lif_spk_seq, dim=0)   # [T, B, N2]
+        li_input = self.fc_li(lif_spk_seq)              # [T, B, N1]
+        li_mem = self.li(li_input)                    # [T, B, N1]
+        return self.mlp(li_mem[-1])                     # [B, latent_dim]
 
 
 class Autoencoder(nn.Module):
@@ -78,7 +107,8 @@ class Autoencoder(nn.Module):
         self.spike_encoder = SpikeEncoder(input_dim, num_hidden_neurons,
                                           num_encoder_neurons, beta=0.9,
                                           num_steps=num_steps)
-        self.spike_output = SpikeDecoder(num_encoder_neurons, latent_dim)
+        self.spike_output = SpikeDecoder(n2=num_encoder_neurons, n1=num_hidden_neurons,
+                                         n4=latent_dim)
         # Adapter to direct output from the spike train output to CLIP
         # self.adapter = ...
         self.composite = nn.Sequential(self.cnn,
@@ -158,8 +188,7 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
                       f"recon {recon_loss.item():.4f} | "
                       f"semantic {semantic_loss.item():.4f} | "
                       f"sparsity {sparsity_loss.item():.4f} | "
-                      f"total {total_loss.item():.4f} | "
-                      f"elapsed {round(time.time() - start_time, 2)}")
+                      f"total {total_loss.item():.4f}")
             counter += 1
 
         for m in trainable:
@@ -185,7 +214,8 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
               f"recon {avg_recon:.4f} | "
               f"semantic {avg_semantic:.4f} | "
               f"sparsity {avg_sparsity:.4f} | "
-              f"total {avg_total:.4f}")
+              f"total {avg_total:.4f} | "
+              f"elapsed {round(time.time() - start_time, 2)}")
 
         for m in trainable:
             m.train()
@@ -207,6 +237,9 @@ if __name__ == "__main__":
     num_epochs = 30
     cnn_feature_dim = 1280
     clip_embed_dim = 512
+    decoder_beta_lif = 0.9
+    decoder_beta_li = 0.95
+    decoder_mlp_hidden = 64
 
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
     clip_model.requires_grad_(False)
@@ -219,17 +252,20 @@ if __name__ == "__main__":
     spike_encoder = SpikeEncoder(cnn_feature_dim, num_hidden_neurons,
                                  num_encoder_neurons, beta=0.9,
                                  num_steps=num_steps).to(device)
-    spike_decoder = SpikeDecoder(num_encoder_neurons, latent_dim).to(device)
+    spike_decoder = SpikeDecoder(n2=num_encoder_neurons,
+                                 n1=num_hidden_neurons,
+                                 n4=latent_dim,
+                                 beta_lif=decoder_beta_lif,
+                                 beta_li=decoder_beta_li,
+                                 n3=decoder_mlp_hidden).to(device)
     recon_head = nn.Linear(latent_dim, cnn_feature_dim).to(device)
     adapter = nn.Linear(latent_dim, clip_embed_dim).to(device)
 
-    optimizer = torch.optim.Adam(
-        list(spike_encoder.parameters()) +
-        list(spike_decoder.parameters()) +
-        list(recon_head.parameters()) +
-        list(adapter.parameters()),
-        lr=5e-4, betas=(0.9, 0.999)
-    )
+    optimizer = torch.optim.Adam(list(spike_encoder.parameters()) +
+                                 list(spike_decoder.parameters()) +
+                                 list(recon_head.parameters()) +
+                                 list(adapter.parameters()),
+                                 lr=5e-4, betas=(0.9, 0.999))
 
     train_dataset = CIFAR10('cifar10', train=True, transform=preprocess,
                             download=True)
