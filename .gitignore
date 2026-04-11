@@ -1,2 +1,6 @@
 cifar10
+mnist
 .venv
+*.mp4
+__pycache__
+tutorial*
