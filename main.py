@@ -11,8 +11,34 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
-from torchvision.models.efficientnet import efficientnet_b0
+from torchvision import transforms
+from torchvision.models.efficientnet import efficientnet_b0, EfficientNet_B0_Weights
 from torchvision.datasets import CIFAR10
+from torch.utils.data import Dataset
+
+
+CNN_TRANSFORM = transforms.Compose([transforms.Resize(256),
+                                    transforms.CenterCrop(224),
+                                    transforms.ToTensor(),
+                                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                         std=[0.229, 0.224, 0.225])])
+
+
+class DualTransformDataset(Dataset):
+    """Wraps a dataset (with no transform) and applies separate transforms
+    for the CNN and CLIP model."""
+
+    def __init__(self, base_dataset, cnn_transform, clip_transform):
+        self.base = base_dataset
+        self.cnn_transform = cnn_transform
+        self.clip_transform = clip_transform
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        img, label = self.base[idx]
+        return self.cnn_transform(img), self.clip_transform(img), label
 
 
 class SpikeEncoder(nn.Module):
@@ -120,23 +146,6 @@ class Autoencoder(nn.Module):
         return spk_rec, mem_rec
 
 
-def compute_normalization(dataset):
-    # May need to set batch size
-    n = 0
-    means = torch.zeros(3)
-    var = torch.zeros(3)
-    for images, _ in DataLoader(dataset, batch_size=256):
-        n += images.shape[0] * images.shape[2] * images.shape[3]
-        means += torch.sum(images, dim=(0, 2, 3))
-    means /= n
-
-    for images, _ in DataLoader(dataset, batch_size=256):
-        for i in range(3):
-            var[i] += torch.sum((images[:, i, :, :] - means[i]) ** 2)
-    var /= n
-    return means, var ** 0.5
-
-
 def print_batch_accuracy(net, data, targets, batch_size, train=False):
     output, _ = net(data)
     _, idx = output.sum(dim=0).max(1)
@@ -148,12 +157,13 @@ def print_batch_accuracy(net, data, targets, batch_size, train=False):
         print(f"Test set accuracy for a single minibatch: {acc*100:.2f}%")
 
 
-def compute_losses(batch_images, cnn, clip_model,
+def compute_losses(cnn_images, clip_images, cnn, clip_model,
                    spike_encoder, spike_decoder, recon_head, adapter, device):
-    batch_images = batch_images.to(device)
+    cnn_images = cnn_images.to(device)
+    clip_images = clip_images.to(device)
     with torch.no_grad():
-        cnn_features = cnn(batch_images)                                # [B, 1280]
-        clip_embedding = clip_model.encode_image(batch_images).float()  # [B, 512]
+        cnn_features = cnn(cnn_images)                                   # [B, 1280]
+        clip_embedding = clip_model.encode_image(clip_images).float()    # [B, 512]
     spk_rec, _ = spike_encoder(cnn_features)  # [T, B, num_encoder_neurons]
     decoded = spike_decoder(spk_rec)          # [B, latent_dim]
     recon = recon_head(decoded)               # [B, 1280]
@@ -170,16 +180,22 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
     start_time = time.time()
     trainable = [spike_encoder, spike_decoder, recon_head, adapter]
     counter = 0
+    recon_history, semantic_history, sparsity_history = [], [], []
     for epoch in range(num_epochs):
-        for batch_images, _ in train_loader:
+        for cnn_imgs, clip_imgs, _ in train_loader:
             recon_loss, semantic_loss, sparsity_loss = compute_losses(
-                batch_images, cnn, clip_model,
+                cnn_imgs, clip_imgs, cnn, clip_model,
                 spike_encoder, spike_decoder, recon_head, adapter, device)
             total_loss = recon_loss + 0.5 * semantic_loss + 0.01 * sparsity_loss
 
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+
+            if counter % 20 == 0:
+                recon_history.append(recon_loss.item())
+                semantic_history.append(semantic_loss.item())
+                sparsity_history.append(sparsity_loss.item())
 
             if counter % 100 == 0:
                 print(f"Iter {counter} | "
@@ -195,9 +211,9 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
         total_recon = total_semantic = total_sparsity = 0.0
         n_batches = 0
         with torch.no_grad():
-            for batch_images, _ in test_loader:
+            for cnn_imgs, clip_imgs, _ in test_loader:
                 rl, sl, spl = compute_losses(
-                    batch_images, cnn, clip_model,
+                    cnn_imgs, clip_imgs, cnn, clip_model,
                     spike_encoder, spike_decoder, recon_head, adapter, device)
                 total_recon += rl.item()
                 total_semantic += sl.item()
@@ -218,6 +234,8 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
         for m in trainable:
             m.train()
 
+    return recon_history, semantic_history, sparsity_history
+
 
 if __name__ == "__main__":
     for module, dev in {torch.cuda: 'cuda:0', torch.mps: 'mps'}.items():
@@ -227,22 +245,22 @@ if __name__ == "__main__":
     else:
         device = torch.device('cpu')
 
-    num_encoder_neurons = 16
-    num_hidden_neurons = 100
-    latent_dim = 16
+    num_encoder_neurons = 128
+    num_hidden_neurons = 256
+    latent_dim = 64
     num_steps = 20
     batch_size = 128
-    num_epochs = 20
+    num_epochs = 100
     cnn_feature_dim = 1280
     clip_embed_dim = 512
     decoder_beta_lif = 0.9
     decoder_beta_li = 0.95
-    decoder_mlp_hidden = 64
+    decoder_mlp_hidden = 128
 
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
     clip_model.requires_grad_(False)
 
-    cnn = efficientnet_b0().to(device)
+    cnn = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1).to(device)
     cnn.classifier = nn.Identity()
     for p in cnn.parameters():
         p.requires_grad_(False)
@@ -265,19 +283,27 @@ if __name__ == "__main__":
                                  list(adapter.parameters()),
                                  lr=5e-4, betas=(0.9, 0.999))
 
-    train_dataset = CIFAR10('cifar10', train=True, transform=preprocess,
-                            download=True)
+    train_dataset = DualTransformDataset(
+        CIFAR10('cifar10', train=True, transform=None, download=True),
+        cnn_transform=CNN_TRANSFORM, clip_transform=preprocess)
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
                               drop_last=True, num_workers=4, shuffle=True)
 
-    test_dataset = CIFAR10('cifar10', train=False, transform=preprocess,
-                           download=True)
+    test_dataset = DualTransformDataset(
+        CIFAR10('cifar10', train=False, transform=None, download=True),
+        cnn_transform=CNN_TRANSFORM, clip_transform=preprocess)
     test_loader = DataLoader(test_dataset, batch_size=batch_size,
                              drop_last=True, num_workers=4, shuffle=False)
 
-    training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
-                  clip_model, train_loader, test_loader, optimizer, num_epochs,
-                  num_steps, device)
+    recon_h, semantic_h, sparsity_h = training_loop(
+        cnn, spike_encoder, spike_decoder, recon_head, adapter,
+        clip_model, train_loader, test_loader, optimizer, num_epochs,
+        num_steps, device)
+
+    np.savez("loss_history.npz",
+             recon=recon_h,
+             semantic=semantic_h,
+             sparsity=sparsity_h)
 
     model = {
         "spike_encoder": spike_encoder.state_dict(),
@@ -291,6 +317,7 @@ if __name__ == "__main__":
             "latent_dim": latent_dim,
             "num_steps": num_steps,
             "num_epochs": num_epochs,
+            "decoder_mlp_hidden": decoder_mlp_hidden,
         },
     }
     torch.save(model, "model.pt")
