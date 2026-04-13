@@ -23,6 +23,12 @@ CNN_TRANSFORM = transforms.Compose([transforms.Resize(256),
                                     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                          std=[0.229, 0.224, 0.225])])
 
+CNN_TRAIN_TRANSFORM = transforms.Compose([transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+                                          transforms.RandomHorizontalFlip(),
+                                          transforms.ToTensor(),
+                                          transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                               std=[0.229, 0.224, 0.225])])
+
 
 class DualTransformDataset(Dataset):
     """Wraps a dataset (with no transform) and applies separate transforms
@@ -106,44 +112,8 @@ class SpikeDecoder(nn.Module):
             lif_spk_seq.append(spk)
         lif_spk_seq = torch.stack(lif_spk_seq, dim=0)   # [T, B, N2]
         li_input = self.fc_li(lif_spk_seq)              # [T, B, N1]
-        li_mem = self.li(li_input)                    # [T, B, N1]
-        return self.mlp(li_mem[-1])                     # [B, latent_dim]
-
-
-class Autoencoder(nn.Module):
-
-    def __init__(self, num_hidden_neurons, num_encoder_neurons, latent_dim,
-                 num_steps):
-        """
-        Parameters
-        ------------
-        input_dim: the dimension of the input data
-        num_hidden_neuron: number of neurons in the hidden layer within the spike encoder
-        num_encoder_neuron: number of neurons in the output layer of the spike encoder
-        latent_dim: dimension of the output layer of the spike decoder
-        num_steps: number of time steps for the encoding process
-        """
-        super().__init__()
-        self.cnn = efficientnet_b0()
-        self.cnn.classifier = nn.Identity()
-        # This only works for EfficientNet and MobileNet from TorchVision
-        input_dim = 1280
-        self.spike_encoder = SpikeEncoder(input_dim, num_hidden_neurons,
-                                          num_encoder_neurons, beta=0.9,
-                                          num_steps=num_steps)
-        self.spike_output = SpikeDecoder(n2=num_encoder_neurons, n1=num_hidden_neurons,
-                                         n4=latent_dim)
-        # Adapter to direct output from the spike train output to CLIP
-        # self.adapter = ...
-        self.composite = nn.Sequential(self.cnn,
-                                       self.spike_encoder,
-                                       self.spike_output)
-
-    def forward(self, input):
-        cnn_out = self.cnn(input)
-        spk_rec, mem_rec = self.spike_encoder(cnn_out)
-        _ = self.spike_output(spk_rec)
-        return spk_rec, mem_rec
+        li_mem = self.li(li_input)                      # [T, B, N1]
+        return self.mlp(li_mem.mean(dim=0))              # [B, latent_dim]
 
 
 def print_batch_accuracy(net, data, targets, batch_size, train=False):
@@ -175,8 +145,8 @@ def compute_losses(cnn_images, clip_images, cnn, clip_model,
 
 
 def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
-                  clip_model, train_loader, test_loader, optimizer, num_epochs,
-                  num_steps, device):
+                  clip_model, train_loader, test_loader, optimizer, scheduler,
+                  num_epochs, num_steps, device):
     start_time = time.time()
     trainable = [spike_encoder, spike_decoder, recon_head, adapter]
     counter = 0
@@ -186,7 +156,7 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
             recon_loss, semantic_loss, sparsity_loss = compute_losses(
                 cnn_imgs, clip_imgs, cnn, clip_model,
                 spike_encoder, spike_decoder, recon_head, adapter, device)
-            total_loss = recon_loss + 0.5 * semantic_loss + 0.01 * sparsity_loss
+            total_loss = recon_loss + semantic_loss + 0.05 * sparsity_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -196,13 +166,6 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
                 recon_history.append(recon_loss.item())
                 semantic_history.append(semantic_loss.item())
                 sparsity_history.append(sparsity_loss.item())
-
-            if counter % 100 == 0:
-                print(f"Iter {counter} | "
-                      f"recon {recon_loss.item():.4f} | "
-                      f"semantic {semantic_loss.item():.4f} | "
-                      f"sparsity {sparsity_loss.item():.4f} | "
-                      f"total {total_loss.item():.4f}")
             counter += 1
 
         for m in trainable:
@@ -231,6 +194,8 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
               f"total {avg_total:.4f} | "
               f"elapsed {round(time.time() - start_time, 2)}")
 
+        scheduler.step()
+
         for m in trainable:
             m.train()
 
@@ -245,9 +210,9 @@ if __name__ == "__main__":
     else:
         device = torch.device('cpu')
 
-    num_encoder_neurons = 128
-    num_hidden_neurons = 256
-    latent_dim = 64
+    num_encoder_neurons = 256
+    num_hidden_neurons = 512
+    latent_dim = 128
     num_steps = 20
     batch_size = 128
     num_epochs = 100
@@ -275,17 +240,21 @@ if __name__ == "__main__":
                                  beta_li=decoder_beta_li,
                                  n3=decoder_mlp_hidden).to(device)
     recon_head = nn.Linear(latent_dim, cnn_feature_dim).to(device)
-    adapter = nn.Linear(latent_dim, clip_embed_dim).to(device)
+    adapter = nn.Sequential(nn.Linear(latent_dim, 256),
+                            nn.ReLU(),
+                            nn.Linear(256, clip_embed_dim)).to(device)
 
     optimizer = torch.optim.Adam(list(spike_encoder.parameters()) +
                                  list(spike_decoder.parameters()) +
                                  list(recon_head.parameters()) +
                                  list(adapter.parameters()),
                                  lr=5e-4, betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-5)
 
     train_dataset = DualTransformDataset(
         CIFAR10('cifar10', train=True, transform=None, download=True),
-        cnn_transform=CNN_TRANSFORM, clip_transform=preprocess)
+        cnn_transform=CNN_TRAIN_TRANSFORM, clip_transform=preprocess)
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
                               drop_last=True, num_workers=4, shuffle=True)
 
@@ -297,8 +266,8 @@ if __name__ == "__main__":
 
     recon_h, semantic_h, sparsity_h = training_loop(
         cnn, spike_encoder, spike_decoder, recon_head, adapter,
-        clip_model, train_loader, test_loader, optimizer, num_epochs,
-        num_steps, device)
+        clip_model, train_loader, test_loader, optimizer, scheduler,
+        num_epochs, num_steps, device)
 
     np.savez("loss_history.npz",
              recon=recon_h,
