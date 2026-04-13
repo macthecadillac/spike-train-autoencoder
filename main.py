@@ -156,7 +156,7 @@ def training_loop(cnn, spike_encoder, spike_decoder, recon_head, adapter,
             recon_loss, semantic_loss, sparsity_loss = compute_losses(
                 cnn_imgs, clip_imgs, cnn, clip_model,
                 spike_encoder, spike_decoder, recon_head, adapter, device)
-            total_loss = recon_loss + semantic_loss + 0.05 * sparsity_loss
+            total_loss = recon_loss + semantic_loss + 0.02 * sparsity_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -215,14 +215,14 @@ if __name__ == "__main__":
     latent_dim = 128
     num_steps = 20
     batch_size = 128
-    num_epochs = 100
+    num_epochs = 10
     cnn_feature_dim = 1280
-    clip_embed_dim = 512
+    clip_embed_dim = 768  # clip ViT-L/14 embedding input dimensions
     decoder_beta_lif = 0.9
     decoder_beta_li = 0.95
     decoder_mlp_hidden = 128
 
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    clip_model, preprocess = clip.load("ViT-L/14", device=device)
     clip_model.requires_grad_(False)
 
     cnn = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1).to(device)
@@ -287,6 +287,8 @@ if __name__ == "__main__":
             "num_steps": num_steps,
             "num_epochs": num_epochs,
             "decoder_mlp_hidden": decoder_mlp_hidden,
+            "clip_model": "ViT-L/14",
+            "clip_embed_dim": clip_embed_dim,
         },
     }
     torch.save(model, "model.pt")
