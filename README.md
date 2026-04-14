@@ -41,3 +41,6 @@ Final results (8000 images):
   Spike model accuracy:  96.61% (7729 / 8000)
   Agreement rate:        96.55% (7724 / 8000)
 ```
+
+Training loss history
+![Training loss](loss_history.png)
