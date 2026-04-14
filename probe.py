@@ -9,7 +9,7 @@ from torchvision.models.efficientnet import efficientnet_b0, EfficientNet_B0_Wei
 
 from sklearn.linear_model import LogisticRegression
 
-from main import SpikeEncoder, SpikeDecoder, CNN_TRANSFORM, CNN_TRAIN_TRANSFORM, DualTransformDataset
+from train import SpikeEncoder, SpikeDecoder, CNN_TRANSFORM, CNN_TRAIN_TRANSFORM, DualTransformDataset
 
 
 def extract_embeddings(loader, cnn, clip_model, spike_encoder, spike_decoder, adapter, device):

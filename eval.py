@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import STL10
 from torchvision.models.efficientnet import efficientnet_b0, EfficientNet_B0_Weights
 
-from main import SpikeEncoder, SpikeDecoder, CNN_TRANSFORM, DualTransformDataset
+from train import SpikeEncoder, SpikeDecoder, CNN_TRANSFORM, DualTransformDataset
 
 
 if __name__ == "__main__":
