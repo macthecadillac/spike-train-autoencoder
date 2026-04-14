@@ -17,6 +17,17 @@ To train the model, run
 $ python3 main.py
 ```
 
+To run the model, run
+```bash
+python3 generate.py --image input.jpg --output output.png
+```
+
+| Input | Output |
+|-------|-----------|
+| ![Input](dog.png) | ![Generated](dog-generated.png) |
+| ![Input](bird.png) | ![Generated](bird-generated.png) |
+| ![Input](car.png) | ![Generated](car-generated.png) |
+
 ### Stats
 
 To evaluate the model's accuracy based on the alignment of the generated
@@ -27,6 +38,6 @@ $ python3 eval.py
 
 Final results (8000 images):
   Direct CLIP accuracy:  99.41% (7953 / 8000)
-  Spike model accuracy:  95.97% (7678 / 8000)
-  Agreement rate:        95.93% (7674 / 8000)
+  Spike model accuracy:  96.61% (7729 / 8000)
+  Agreement rate:        96.55% (7724 / 8000)
 ```
