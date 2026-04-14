@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from torchvision import transforms
 from torchvision.models.efficientnet import efficientnet_b0, EfficientNet_B0_Weights
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import STL10
 from torch.utils.data import Dataset
 
 
@@ -133,13 +133,16 @@ def compute_losses(cnn_images, clip_images, cnn, clip_model,
     clip_images = clip_images.to(device)
     with torch.no_grad():
         cnn_features = cnn(cnn_images)                                   # [B, 1280]
-        clip_embedding = clip_model.encode_image(clip_images).float()    # [B, 512]
+        clip_embedding = clip_model.encode_image(clip_images).float()    # [B, 768]
     spk_rec, _ = spike_encoder(cnn_features)  # [T, B, num_encoder_neurons]
     decoded = spike_decoder(spk_rec)          # [B, latent_dim]
     recon = recon_head(decoded)               # [B, 1280]
-    clip_hat = adapter(decoded)               # [B, 512]
+    clip_hat = adapter(decoded)               # [B, 768]
     recon_loss = F.mse_loss(recon, cnn_features)
-    semantic_loss = 1 - F.cosine_similarity(clip_hat, clip_embedding.detach()).mean()
+    clip_hat_norm = F.normalize(clip_hat, dim=-1)
+    clip_embed_norm = F.normalize(clip_embedding.detach(), dim=-1)
+    semantic_loss = (1 - F.cosine_similarity(clip_hat_norm, clip_embed_norm).mean()) \
+                    + 0.5 * F.mse_loss(clip_hat_norm, clip_embed_norm)
     sparsity_loss = spk_rec.mean()
     return recon_loss, semantic_loss, sparsity_loss
 
@@ -212,10 +215,10 @@ if __name__ == "__main__":
 
     num_encoder_neurons = 256
     num_hidden_neurons = 512
-    latent_dim = 128
+    latent_dim = 768
     num_steps = 20
     batch_size = 128
-    num_epochs = 10
+    num_epochs = 30
     cnn_feature_dim = 1280
     clip_embed_dim = 768  # clip ViT-L/14 embedding input dimensions
     decoder_beta_lif = 0.9
@@ -240,9 +243,7 @@ if __name__ == "__main__":
                                  beta_li=decoder_beta_li,
                                  n3=decoder_mlp_hidden).to(device)
     recon_head = nn.Linear(latent_dim, cnn_feature_dim).to(device)
-    adapter = nn.Sequential(nn.Linear(latent_dim, 256),
-                            nn.ReLU(),
-                            nn.Linear(256, clip_embed_dim)).to(device)
+    adapter = nn.Linear(latent_dim, clip_embed_dim).to(device)
 
     optimizer = torch.optim.Adam(list(spike_encoder.parameters()) +
                                  list(spike_decoder.parameters()) +
@@ -253,13 +254,13 @@ if __name__ == "__main__":
         optimizer, T_max=num_epochs, eta_min=1e-5)
 
     train_dataset = DualTransformDataset(
-        CIFAR10('cifar10', train=True, transform=None, download=True),
+        STL10('stl10', split='train+unlabeled', transform=None, download=True),
         cnn_transform=CNN_TRAIN_TRANSFORM, clip_transform=preprocess)
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
                               drop_last=True, num_workers=4, shuffle=True)
 
     test_dataset = DualTransformDataset(
-        CIFAR10('cifar10', train=False, transform=None, download=True),
+        STL10('stl10', split='test', transform=None, download=True),
         cnn_transform=CNN_TRANSFORM, clip_transform=preprocess)
     test_loader = DataLoader(test_dataset, batch_size=batch_size,
                              drop_last=True, num_workers=4, shuffle=False)
@@ -288,6 +289,7 @@ if __name__ == "__main__":
             "num_epochs": num_epochs,
             "decoder_mlp_hidden": decoder_mlp_hidden,
             "clip_model": "ViT-L/14",
+            "dataset": "stl10",
             "clip_embed_dim": clip_embed_dim,
         },
     }

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import STL10
 from torchvision.models.efficientnet import efficientnet_b0, EfficientNet_B0_Weights
 
 from main import SpikeEncoder, SpikeDecoder, CNN_TRANSFORM, DualTransformDataset
@@ -39,11 +39,8 @@ if __name__ == "__main__":
                                  n1=hp["n_hidden"],
                                  n4=hp["latent_dim"],
                                  n3=n3).to(device)
-    adapter_hidden = checkpoint["adapter"]["0.weight"].shape[0]
     clip_embed_dim = hp.get("clip_embed_dim", 512)
-    adapter = nn.Sequential(nn.Linear(hp["latent_dim"], adapter_hidden),
-                            nn.ReLU(),
-                            nn.Linear(adapter_hidden, clip_embed_dim)).to(device)
+    adapter = nn.Linear(hp["latent_dim"], clip_embed_dim).to(device)
 
     spike_encoder.load_state_dict(checkpoint["spike_encoder"])
     spike_decoder.load_state_dict(checkpoint["spike_decoder"])
@@ -53,16 +50,16 @@ if __name__ == "__main__":
         m.eval()
         m.requires_grad_(False)
 
-    CIFAR10_CLASSES = ["airplane", "automobile", "bird", "cat", "deer",
-                       "dog", "frog", "horse", "ship", "truck"]
+    stl10_base = STL10("stl10", split="test", transform=None, download=True)
+    classes = stl10_base.classes
 
-    prompts = clip.tokenize([f"a photo of a {c}" for c in CIFAR10_CLASSES]).to(device)
+    prompts = clip.tokenize([f"a photo of a {c}" for c in classes]).to(device)
     with torch.no_grad():
         text_features = F.normalize(clip_model.encode_text(prompts).float(),
                                     dim=-1)  # [10, clip_embed_dim]
 
     test_dataset = DualTransformDataset(
-        CIFAR10("cifar10", train=False, transform=None, download=True),
+        stl10_base,
         cnn_transform=CNN_TRANSFORM,
         clip_transform=preprocess,
     )
